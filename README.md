@@ -1,6 +1,5 @@
 # 🧠 Neural Resonance Protocol
 ### Real-Time Inter-Brain Synchronization Game
-*Ria & Arushi Agarwal — CONECT Hackathon 2026*
 
 A cooperative two-player game that uses live EEG data from an OpenBCI headset to measure and visualize neural synchrony between players in real time. The game enforces true interdependence — neither player can win alone — and logs inter-brain coherence data for post-session research analysis.
 
@@ -43,7 +42,7 @@ Open the OpenBCI GUI, connect your Cyton board, and start an LSL stream before l
 
 **Step 2 — Launch**
 ```bash
-python game.py
+python neural_resonance.py
 ```
 
 **Step 3 — Select difficulty**
@@ -131,7 +130,7 @@ If no LSL stream is found (e.g. no headset connected), the game runs automatical
 ## Project Structure
 
 ```
-├── game.py              # Main game + BCI processing thread
+├── neural_resonance.py              # Main game + BCI processing thread
 └── README.md
 ```
 
