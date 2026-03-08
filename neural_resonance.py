@@ -1,10 +1,9 @@
 import pygame
-import random
-import sys
+import random, sys
 import socket
-import time
-import math
+import time, math
 import threading
+from scipy.signal import hilbert
 
 # Shared BCI connection status — updated by the background thread, read by HUD
 bci_status = "INITIALIZING"   # possible values: INITIALIZING, BUFFERING, LIVE, DEMO, ERROR
@@ -43,7 +42,14 @@ def start_bci_processing():
             def band_sync(sigA, sigB, low, high):
                 A = bandpass(sigA, low, high, fs)
                 B = bandpass(sigB, low, high, fs)
-                return np.corrcoef(A, B)[0, 1]
+
+                phaseA = np.angle(hilbert(A))
+                phaseB = np.angle(hilbert(B))
+
+                phase_diff = phaseA - phaseB
+                plv = np.abs(np.mean(np.exp(1j * phase_diff)))
+
+                return plv
 
             print("[BCI] Looking for EEG streams...")
             streams = resolve_streams()
@@ -88,9 +94,18 @@ def start_bci_processing():
                 personA = filtered[0:4]
                 personB = filtered[4:8]
 
-                alpha_sync = band_sync(personA[0], personB[0], 8,  12)
-                beta_sync  = band_sync(personA[0], personB[0], 13, 30)
-                theta_sync = band_sync(personA[0], personB[0], 4,   7)
+                alpha_syncs = []
+                beta_syncs = []
+                theta_syncs = []
+
+                for ch in range(4):
+                    alpha_syncs.append(band_sync(personA[ch], personB[ch], 8, 12))
+                    beta_syncs.append(band_sync(personA[ch], personB[ch], 13, 30))
+                    theta_syncs.append(band_sync(personA[ch], personB[ch], 4, 7))
+
+                alpha_sync = np.mean(alpha_syncs)
+                beta_sync  = np.mean(beta_syncs)
+                theta_sync = np.mean(theta_syncs)
 
                 team_score = (
                     0.4 * alpha_sync +
@@ -104,6 +119,15 @@ def start_bci_processing():
                 bar = '█' * int(team_score_clamped * 30)
                 print(f"[BCI] α={alpha_sync:+.3f}  β={beta_sync:+.3f}  "
                       f"θ={theta_sync:+.3f}  SCORE={team_score_clamped:.3f}  [{bar:<30}]")
+                
+                if not hasattr(run, "log"):
+                    run.log = open("session_log.csv","w")
+                    run.log.write("time,alpha,beta,theta,score\n")
+
+                t = time.time()
+
+                run.log.write(f"{t},{alpha_sync},{beta_sync},{theta_sync},{team_score_clamped}\n")
+                run.log.flush()
 
         except Exception as e:
             print(f"[BCI] Error in processing thread: {e}")
