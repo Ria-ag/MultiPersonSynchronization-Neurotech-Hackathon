@@ -581,10 +581,6 @@ def draw_end_screen(screen, score, avg_sync, max_sync, tick):
     footer = font_mono_sm.render("PRESS  ESC  TO  EXIT", True, WHITE_DIM)
     screen.blit(footer, (WIDTH//2 - footer.get_width()//2, py + 345))
 
-    # Draw sync ring in background decoratively
-    draw_sync_ring(WIDTH//2 + 280, HEIGHT//2, avg_sync, tick)
-
-
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     player_pos = [WIDTH // 2, HEIGHT // 2]
