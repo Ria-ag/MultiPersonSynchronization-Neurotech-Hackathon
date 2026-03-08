@@ -4,6 +4,114 @@ import sys
 import socket
 import time
 import math
+import threading
+
+# Shared BCI connection status — updated by the background thread, read by HUD
+bci_status = "INITIALIZING"   # possible values: INITIALIZING, BUFFERING, LIVE, DEMO, ERROR
+
+# ─── BCI Processing (runs in background thread) ───────────────────────────────
+def start_bci_processing():
+    """
+    Launches processing.py logic in a daemon thread.
+    Reads from LSL, computes team sync score, sends to game via UDP.
+    Daemon=True means it auto-kills when the game window closes.
+    """
+    def run():
+        global bci_status
+        try:
+            from pylsl import StreamInlet, resolve_streams
+            from scipy.signal import butter, filtfilt, welch
+            import numpy as np
+
+            UDP_IP   = "127.0.0.1"
+            UDP_PORT = 5005
+            out_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+            fs             = 250
+            WINDOW_SAMPLES = 1250
+            UPDATE_EVERY   = 25
+
+            def bandpass(data, low, high, fs, order=4):
+                nyq = 0.5 * fs
+                b, a = butter(order, [low/nyq, high/nyq], btype='band')
+                return filtfilt(b, a, data)
+
+            def band_power(signal, low, high):
+                freqs, psd = welch(signal, fs, nperseg=min(256, len(signal)))
+                return np.mean(psd[(freqs >= low) & (freqs <= high)])
+
+            def band_sync(sigA, sigB, low, high):
+                A = bandpass(sigA, low, high, fs)
+                B = bandpass(sigB, low, high, fs)
+                return np.corrcoef(A, B)[0, 1]
+
+            print("[BCI] Looking for EEG streams...")
+            streams = resolve_streams()
+            if len(streams) == 0:
+                print("[BCI] No LSL streams found — running in demo mode.")
+                bci_status = "DEMO"
+                return
+
+            inlet = StreamInlet(streams[0])
+            print(f"[BCI] Connected to stream '{streams[0].name()}'. Collecting data...")
+            bci_status = "BUFFERING"
+
+            buffer = []
+            samples_since_update = 0
+
+            while True:
+                sample, _ = inlet.pull_sample()
+                buffer.append(sample)
+                samples_since_update += 1
+
+                if len(buffer) > WINDOW_SAMPLES:
+                    buffer.pop(0)
+
+                # Still filling the initial window — show buffer progress
+                if len(buffer) < WINDOW_SAMPLES:
+                    pct = int(100 * len(buffer) / WINDOW_SAMPLES)
+                    bci_status = f"BUFFERING {pct}%"
+                    continue
+
+                if samples_since_update < UPDATE_EVERY:
+                    continue
+
+                samples_since_update = 0
+                bci_status = "LIVE"
+
+                data     = np.array(buffer)
+                eeg      = data.T
+                filtered = np.zeros_like(eeg)
+                for ch in range(8):
+                    filtered[ch] = bandpass(eeg[ch], 1, 40, fs)
+
+                personA = filtered[0:4]
+                personB = filtered[4:8]
+
+                alpha_sync = band_sync(personA[0], personB[0], 8,  12)
+                beta_sync  = band_sync(personA[0], personB[0], 13, 30)
+                theta_sync = band_sync(personA[0], personB[0], 4,   7)
+
+                team_score = (
+                    0.4 * alpha_sync +
+                    0.4 * beta_sync  +
+                    0.2 * theta_sync
+                )
+
+                team_score_clamped = float(np.clip(team_score, 0.0, 1.0))
+                out_sock.sendto(str(team_score_clamped).encode(), (UDP_IP, UDP_PORT))
+
+                bar = '█' * int(team_score_clamped * 30)
+                print(f"[BCI] α={alpha_sync:+.3f}  β={beta_sync:+.3f}  "
+                      f"θ={theta_sync:+.3f}  SCORE={team_score_clamped:.3f}  [{bar:<30}]")
+
+        except Exception as e:
+            print(f"[BCI] Error in processing thread: {e}")
+            print("[BCI] Falling back to demo mode.")
+            bci_status = "ERROR"
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
 
 # --- Constants & Colors ---
 WIDTH, HEIGHT = 1200, 750
@@ -314,6 +422,28 @@ def draw_top_hud(remaining, score, sync, tick):
     sub = font_mono_sm.render("OpenBCI  ·  EEG INTER-BRAIN SYNC", True, CYAN_DIM)
     screen.blit(sub, (20, 34))
 
+    # BCI status indicator
+    status_colors = {
+        "LIVE":         (SYNCED_COLOR, (10, 40, 25)),
+        "DEMO":         (AMBER,        (40, 30, 5)),
+        "ERROR":        (DANGER,       (40, 8, 8)),
+        "INITIALIZING": (WHITE_DIM,    (20, 25, 45)),
+    }
+    status_key = ("LIVE" if bci_status == "LIVE"
+                  else "INITIALIZING" if bci_status.startswith("BUFFERING")
+                  else bci_status if bci_status in status_colors
+                  else "ERROR")
+    s_fg, _ = status_colors.get(status_key, (WHITE_DIM, (20, 25, 45)))
+    dot_x = 282
+    # Blink dot when LIVE, solid otherwise
+    show_dot = not (bci_status == "LIVE" and (tick // 20) % 2 == 0)
+    if show_dot:
+        pygame.draw.circle(screen, s_fg, (dot_x, 41), 5)
+    else:
+        pygame.draw.circle(screen, s_fg, (dot_x, 41), 5, 1)
+    status_surf = font_mono_sm.render(bci_status, True, s_fg)
+    screen.blit(status_surf, (dot_x + 10, 34))
+
     # Center: Timer
     t_color = lerp_color(WHITE, DANGER, max(0, 1 - remaining/15))
     time_str = f"{int(remaining):02d}s"
@@ -584,4 +714,5 @@ def main():
 
 
 if __name__ == "__main__":
+    start_bci_processing()
     main()
