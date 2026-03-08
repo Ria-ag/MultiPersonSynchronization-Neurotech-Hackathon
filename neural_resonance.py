@@ -8,6 +8,11 @@ from scipy.signal import hilbert
 # Shared BCI connection status — updated by the background thread, read by HUD
 bci_status = "INITIALIZING"   # possible values: INITIALIZING, BUFFERING, LIVE, DEMO, ERROR
 
+# Raw EEG samples accumulated across the full session for end-screen coherence calculation
+# Each entry is (p1_sample, p2_sample) — one scalar pair per Cyton sample
+session_eeg_buffer = []
+session_eeg_lock   = threading.Lock()
+
 # ─── BCI Processing (runs in background thread) ───────────────────────────────
 def start_bci_processing():
     """
@@ -70,6 +75,10 @@ def start_bci_processing():
                 buffer.append(sample)
                 samples_since_update += 1
 
+                # Accumulate raw signal pairs for full-session coherence at end screen
+                with session_eeg_lock:
+                    session_eeg_buffer.append((sample[0], sample[4]))  # P1 ch0, P2 ch0
+
                 if len(buffer) > WINDOW_SAMPLES:
                     buffer.pop(0)
 
@@ -114,7 +123,9 @@ def start_bci_processing():
                 )
 
                 team_score_clamped = float(np.clip(team_score, 0.0, 1.0))
-                out_sock.sendto(str(team_score_clamped).encode(), (UDP_IP, UDP_PORT))
+                out_sock.sendto(
+                    f"{team_score_clamped:.4f},{alpha_sync:.4f},{beta_sync:.4f},{theta_sync:.4f}".encode(),
+                    (UDP_IP, UDP_PORT))
 
                 bar = '█' * int(team_score_clamped * 30)
                 print(f"[BCI] α={alpha_sync:+.3f}  β={beta_sync:+.3f}  "
@@ -166,15 +177,15 @@ HUD_BG        = (8, 14, 30, 200)
 PANEL_BORDER  = (30, 50, 100)
 
 # --- Networking Setup ---
-UDP_IP = "127.0.0.1"
+UDP_IP   = "127.0.0.1"
 UDP_PORT = 5005
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind((UDP_IP, UDP_PORT))
-sock.setblocking(False)
+
+# ─── NOTE: sock is created inside main() so a busy port on restart
+#     doesn't crash the script before the pygame window opens. ─────────────────
 
 pygame.init()
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("NEURAL RESONANCE PROTOCOL  ·  OpenBCI")
+pygame.display.set_caption("NEURAL SYNCHRONICITY TEST  ·  OpenBCI")
 clock = pygame.time.Clock()
 
 # Fonts
@@ -441,7 +452,7 @@ def draw_top_hud(remaining, score, sync, tick):
         pygame.draw.rect(screen, (*time_color, 120), (0, 56, accent_w, 2))
 
     # Left: Title
-    title = font_mono_md.render("NEURAL RESONANCE PROTOCOL", True, CYAN)
+    title = font_mono_md.render("NEURAL SYNCHRONICITY TEST", True, CYAN)
     screen.blit(title, (20, 10))
     sub = font_mono_sm.render("OpenBCI  ·  EEG INTER-BRAIN SYNC", True, CYAN_DIM)
     screen.blit(sub, (20, 34))
@@ -536,23 +547,22 @@ def draw_bottom_hud(sync, sync_history, tick):
     screen.blit(wf_label, (wf_x + 4, wf_y + 4))
 
 
-def draw_side_stats(sync, score, tick):
-    # Right side mini panel
+def draw_side_stats(sync, score, tick, band_vals):
     px, py, pw, ph = WIDTH - 220, 80, 200, 200
     panel = alpha_surface(BG_MID, pw, ph, 180)
     screen.blit(panel, (px, py))
     pygame.draw.rect(screen, PANEL_BORDER, (px, py, pw, ph), 1)
 
     items = [
-        ("FREQ BAND",   "ALPHA"),
-        ("ELECTRODE",   "Fp1/Fp2"),
-        ("COHERENCE",   f"{int(sync*100)}%"),
-        ("CAPTURES",    str(score)),
-        ("TICK",        str(tick % 10000)),
+        ("COMPOSITE",  f"{int(sync*100)}%",                       sync),
+        ("α ALPHA",    f"{int(band_vals['alpha']*100):+d}%",      max(0, band_vals['alpha'])),
+        ("β BETA",     f"{int(band_vals['beta']*100):+d}%",       max(0, band_vals['beta'])),
+        ("θ THETA",    f"{int(band_vals['theta']*100):+d}%",      max(0, band_vals['theta'])),
+        ("CAPTURES",   str(score),                                 0.5),
     ]
-    for i, (label, val) in enumerate(items):
+    for i, (label, val, t) in enumerate(items):
         l_surf = font_mono_sm.render(label, True, WHITE_DIM)
-        v_color = lerp_color(WHITE_DIM, SYNCED_COLOR, sync) if label == "COHERENCE" else WHITE
+        v_color = lerp_color(WHITE_DIM, SYNCED_COLOR, min(t, 1.0))
         v_surf  = font_mono_sm.render(val, True, v_color)
         row_y = py + 14 + i * 34
         screen.blit(l_surf, (px + 10, row_y))
@@ -561,88 +571,570 @@ def draw_side_stats(sync, score, tick):
             pygame.draw.line(screen, PANEL_BORDER, (px+8, row_y + 20), (px + pw - 8, row_y + 20), 1)
 
 
+# ─── Full-session coherence (computed once at game over) ──────────────────────
+def compute_session_coherence():
+    """
+    Magnitude-squared coherence averaged across the alpha band (8-12 Hz),
+    computed over the entire session's raw EEG data.
+
+    This is a proper frequency-domain measure — different from the real-time
+    Pearson correlation used for the live sync score.
+
+    Returns a float in [0, 1], or None if not enough data.
+    """
+    with session_eeg_lock:
+        if len(session_eeg_buffer) < 500:   # need at least 2 seconds
+            return None
+        pairs = list(session_eeg_buffer)    # snapshot
+
+    try:
+        from scipy.signal import coherence, butter, filtfilt
+        import numpy as np
+
+        fs = 250
+        sig_p1 = np.array([p[0] for p in pairs], dtype=np.float64)
+        sig_p2 = np.array([p[1] for p in pairs], dtype=np.float64)
+
+        # Broadband filter first (1-40 Hz) — same as processing pipeline
+        nyq = fs / 2.0
+        b, a = butter(4, [1/nyq, 40/nyq], btype='band')
+        sig_p1 = filtfilt(b, a, sig_p1)
+        sig_p2 = filtfilt(b, a, sig_p2)
+
+        # Magnitude-squared coherence across full signal
+        nperseg = min(512, len(sig_p1) // 4)
+        freqs, Cxy = coherence(sig_p1, sig_p2, fs=fs, nperseg=nperseg)
+
+        # Average across alpha band (8-12 Hz)
+        alpha_mask = (freqs >= 8) & (freqs <= 12)
+        alpha_coh  = float(np.mean(Cxy[alpha_mask])) if np.any(alpha_mask) else 0.0
+
+        # Also compute beta and theta for breakdown display
+        beta_mask  = (freqs >= 13) & (freqs <= 30)
+        theta_mask = (freqs >= 4)  & (freqs <= 7)
+        beta_coh   = float(np.mean(Cxy[beta_mask]))  if np.any(beta_mask)  else 0.0
+        theta_coh  = float(np.mean(Cxy[theta_mask])) if np.any(theta_mask) else 0.0
+
+        # Weighted composite — same bands as live score for comparability
+        composite = 0.4 * alpha_coh + 0.4 * beta_coh + 0.2 * theta_coh
+
+        return {
+            "composite": float(np.clip(composite, 0, 1)),
+            "alpha":     float(np.clip(alpha_coh,  0, 1)),
+            "beta":      float(np.clip(beta_coh,   0, 1)),
+            "theta":     float(np.clip(theta_coh,  0, 1)),
+            "n_samples": len(pairs),
+        }
+    except Exception as e:
+        print(f"[BCI] Coherence calculation failed: {e}")
+        return None
+
+
+# ─── Capture-sync correlation analysis & HTML export ─────────────────────────
+def analyse_and_export(capture_log, sync_timeline, coherence_data, avg_sync, score, difficulty="MEDIUM"):
+    import csv, os, json
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    base      = os.path.dirname(os.path.abspath(__file__))
+    csv_path  = os.path.join(base, f"session_{difficulty}_{timestamp}.csv")
+    html_path = os.path.join(base, f"session_{difficulty}_{timestamp}.html")
+
+    # ── Write CSV ─────────────────────────────────────────────────────────────
+    capture_times = {t for t, _ in capture_log}
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["time_sec", "neural_sync", "capture", "difficulty"])
+        for t, s in sync_timeline:
+            writer.writerow([t, s, 1 if t in capture_times else 0, difficulty])
+
+    # ── Compute findings ──────────────────────────────────────────────────────
+    findings = {
+        "csv_path":         csv_path,
+        "html_path":        html_path,
+        "capture_avg_sync": None,
+        "noncap_avg_sync":  None,
+        "sync_effect":      None,
+        "interpretation":   "INSUFFICIENT DATA",
+        "n_captures":       score,
+        "difficulty":       difficulty,
+    }
+
+    if len(capture_log) >= 2 and len(sync_timeline) >= 5:
+        capture_syncs    = [s for _, s in capture_log]
+        capture_set      = set(round(t) for t, _ in capture_log)
+        noncapture_syncs = [s for t, s in sync_timeline if round(t) not in capture_set]
+        all_syncs        = [s for _, s in sync_timeline]
+
+        cap_avg  = sum(capture_syncs)    / len(capture_syncs)
+        non_avg  = (sum(noncapture_syncs) / len(noncapture_syncs)) if noncapture_syncs else sum(all_syncs)/len(all_syncs)
+        effect   = cap_avg - non_avg
+
+        findings["capture_avg_sync"] = round(cap_avg, 3)
+        findings["noncap_avg_sync"]  = round(non_avg, 3)
+        findings["sync_effect"]      = round(effect, 3)
+
+        if abs(effect) < 0.03:
+            findings["interpretation"] = "NO SIGNIFICANT EFFECT"
+        elif effect > 0:
+            strength = "STRONG" if effect > 0.10 else "MODERATE" if effect > 0.05 else "WEAK"
+            findings["interpretation"] = f"{strength} POSITIVE CORRELATION"
+        else:
+            findings["interpretation"] = "NEGATIVE CORRELATION"
+
+    # ── Build Plotly HTML ─────────────────────────────────────────────────────
+    try:
+        import json
+        times      = [t for t, _ in sync_timeline]
+        syncs      = [s for _, s in sync_timeline]
+        cap_t      = [t for t, _ in capture_log]
+        cap_s      = [s for _, s in capture_log]
+
+        # Rolling avg (5-point)
+        def rolling(arr, w=5):
+            out = []
+            for i in range(len(arr)):
+                sl = arr[max(0, i-w):i+w+1]
+                out.append(sum(sl)/len(sl))
+            return out
+        smooth = rolling(syncs)
+
+        # Coherence breakdown for annotation
+        coh_text = ""
+        if coherence_data:
+            coh_text = (f"α={int(coherence_data['alpha']*100)}%  "
+                        f"β={int(coherence_data['beta']*100)}%  "
+                        f"θ={int(coherence_data['theta']*100)}%  "
+                        f"composite={int(coherence_data['composite']*100)}%")
+
+        effect_str = (f"{findings['sync_effect']*100:+.1f}%"
+                      if findings['sync_effect'] is not None else "N/A")
+
+        cap_avg_pct  = int((findings['capture_avg_sync'] or 0) * 100)
+        non_avg_pct  = int((findings['noncap_avg_sync']  or 0) * 100)
+        avg_sync_pct = int(avg_sync * 100)
+        effect_val   = findings['sync_effect'] or 0
+        interp_str   = findings['interpretation']
+        diff_color   = 'positive' if difficulty == 'SLOW' else 'amber' if difficulty == 'MEDIUM' else 'negative'
+        effect_color = 'positive' if effect_val > 0.03 else 'negative' if effect_val < -0.03 else 'neutral'
+        interp_color_cls = 'positive' if 'POSITIVE' in interp_str else 'negative' if 'NEGATIVE' in interp_str else 'neutral'
+
+        # Inline Plotly data
+        data = {
+            "sync_times":  times,
+            "syncs":       syncs,
+            "smooth":      smooth,
+            "cap_t":       cap_t,
+            "cap_s":       cap_s,
+            "difficulty":  difficulty,
+            "avg_sync":    round(avg_sync, 3),
+            "cap_avg":     findings["capture_avg_sync"],
+            "non_avg":     findings["noncap_avg_sync"],
+            "effect":      findings["sync_effect"],
+            "effect_str":  effect_str,
+            "interp":      findings["interpretation"],
+            "coh_text":    coh_text,
+            "timestamp":   timestamp,
+            "score":       score,
+        }
+
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Neural Resonance — {difficulty} — {timestamp}</title>
+<script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+<style>
+  body {{ background: #04060e; color: #dce8ff; font-family: 'Courier New', monospace;
+         margin: 0; padding: 30px; }}
+  h1   {{ color: #00dcff; letter-spacing: 4px; font-size: 1.3em; margin-bottom: 4px; }}
+  .sub {{ color: #006490; font-size: 0.8em; letter-spacing: 2px; margin-bottom: 30px; }}
+  .stats {{ display: flex; gap: 30px; margin-bottom: 30px; flex-wrap: wrap; }}
+  .stat  {{ background: #080c1c; border: 1px solid #1e3264;
+            padding: 14px 22px; min-width: 160px; }}
+  .stat .label {{ color: #506090; font-size: 0.72em; letter-spacing: 2px; }}
+  .stat .value {{ font-size: 1.5em; margin-top: 4px; }}
+  .positive {{ color: #50ffa0; }}
+  .neutral  {{ color: #dce8ff; }}
+  .negative {{ color: #ff3c3c; }}
+  .amber    {{ color: #ffb400; }}
+</style>
+</head>
+<body>
+<h1>NEURAL SYNCHRONICITY TEST</h1>
+<div class="sub">INTER-BRAIN SYNCHRONIZATION REPORT  ·  DIFFICULTY: {difficulty}  ·  {timestamp}</div>
+
+<div class="stats">
+  <div class="stat">
+    <div class="label">DIFFICULTY</div>
+    <div class="value {'positive' if difficulty=='SLOW' else 'amber' if difficulty=='MEDIUM' else 'negative'}">{difficulty}</div>
+  </div>
+  <div class="stat">
+    <div class="label">AVG NEURAL SYNC</div>
+    <div class="value neutral">{int(avg_sync*100)}%</div>
+  </div>
+  <div class="stat">
+    <div class="label">TOTAL CAPTURES</div>
+    <div class="value amber">{score}</div>
+  </div>
+  <div class="stat">
+    <div class="label">SYNC AT CAPTURES</div>
+    <div class="value positive">{cap_avg_pct}%</div>
+  </div>
+  <div class="stat">
+    <div class="label">SYNC WITHOUT CAPTURES</div>
+    <div class="value neutral">{non_avg_pct}%</div>
+  </div>
+  <div class="stat">
+    <div class="label">SYNC EFFECT (Δ)</div>
+    <div class="value {effect_color}">{effect_str}</div>
+  </div>
+  <div class="stat">
+    <div class="label">FINDING</div>
+    <div class="value {interp_color_cls}" style="font-size:0.9em">{interp_str}</div>
+  </div>
+</div>
+
+<div id="chart"></div>
+<div id="bars" style="margin-top:20px"></div>
+
+<script>
+const d = {json.dumps(data)};
+
+// ── Main chart: sync timeline + capture markers ────────────────────────────
+const syncLine = {{
+  x: d.sync_times, y: d.syncs,
+  type: 'scatter', mode: 'lines', name: 'Raw Sync',
+  line: {{ color: 'rgba(0,200,255,0.35)', width: 1 }},
+}};
+const smoothLine = {{
+  x: d.sync_times, y: d.smooth,
+  type: 'scatter', mode: 'lines', name: 'Smoothed Sync',
+  line: {{ color: '#00dcff', width: 2.5 }},
+}};
+const captures = {{
+  x: d.cap_t, y: d.cap_s,
+  type: 'scatter', mode: 'markers', name: 'Capture Event',
+  marker: {{ color: '#ffb400', size: 12, symbol: 'diamond',
+             line: {{ color: '#fff', width: 1 }} }},
+}};
+
+// Horizontal reference lines
+const capAvgLine = {{
+  x: [d.sync_times[0], d.sync_times[d.sync_times.length-1]],
+  y: [d.cap_avg, d.cap_avg],
+  type: 'scatter', mode: 'lines', name: 'Avg sync at captures',
+  line: {{ color: 'rgba(80,255,160,0.6)', width: 1.5, dash: 'dot' }},
+}};
+const nonAvgLine = {{
+  x: [d.sync_times[0], d.sync_times[d.sync_times.length-1]],
+  y: [d.non_avg, d.non_avg],
+  type: 'scatter', mode: 'lines', name: 'Avg sync without captures',
+  line: {{ color: 'rgba(220,235,255,0.4)', width: 1.5, dash: 'dot' }},
+}};
+
+const layout1 = {{
+  paper_bgcolor: '#04060e', plot_bgcolor: '#080c1c',
+  font: {{ family: 'Courier New', color: '#dce8ff', size: 11 }},
+  title: {{ text: 'NEURAL SYNC TIMELINE  ·  CAPTURE EVENTS OVERLAID',
+            font: {{ color: '#00dcff', size: 13 }} }},
+  xaxis: {{ title: 'Time (seconds)', gridcolor: '#0f1630', zeroline: false }},
+  yaxis: {{ title: 'Neural Sync Score', range: [-0.05, 1.05],
+            gridcolor: '#0f1630', zeroline: false }},
+  legend: {{ bgcolor: '#080c1c', bordercolor: '#1e3264', borderwidth: 1 }},
+  hovermode: 'x unified',
+  annotations: [{{
+    x: 0.01, y: 0.97, xref: 'paper', yref: 'paper',
+    text: 'Δ = ' + d.effect_str + '  ·  ' + d.interp,
+    showarrow: false,
+    font: {{ color: d.effect > 0.03 ? '#50ffa0' : d.effect < -0.03 ? '#ff3c3c' : '#dce8ff',
+             size: 12 }},
+    align: 'left',
+  }}],
+}};
+
+Plotly.newPlot('chart', [syncLine, smoothLine, captures, capAvgLine, nonAvgLine], layout1,
+  {{responsive: true, displayModeBar: true}});
+
+// ── Bar chart: capture vs non-capture avg sync ─────────────────────────────
+const bars = {{
+  x: ['Sync at Captures', 'Sync Without Captures'],
+  y: [d.cap_avg, d.non_avg],
+  type: 'bar',
+  marker: {{ color: ['#50ffa0', 'rgba(100,120,160,0.6)'],
+             line: {{ color: ['#50ffa0', '#506090'], width: 1.5 }} }},
+  text: [Math.round(d.cap_avg*100)+'%', Math.round(d.non_avg*100)+'%'],
+  textposition: 'outside',
+  textfont: {{ color: '#dce8ff' }},
+}};
+
+const layout2 = {{
+  paper_bgcolor: '#04060e', plot_bgcolor: '#080c1c',
+  font: {{ family: 'Courier New', color: '#dce8ff', size: 11 }},
+  title: {{ text: 'CAPTURE-SYNC CORRELATION  ·  KEY FINDING',
+            font: {{ color: '#00dcff', size: 13 }} }},
+  yaxis: {{ title: 'Avg Neural Sync', range: [0, 1.1],
+            gridcolor: '#0f1630', zeroline: false }},
+  height: 340,
+}};
+
+Plotly.newPlot('bars', [bars], layout2, {{responsive: true, displayModeBar: false}});
+</script>
+</body>
+</html>"""
+
+        with open(html_path, "w") as f:
+            f.write(html)
+        print(f"[RESEARCH] Graph exported → {html_path}")
+
+    except Exception as e:
+        import traceback
+        print(f"[RESEARCH] HTML export failed: {e}")
+        traceback.print_exc()
+
+    print(f"[RESEARCH] CSV exported  → {csv_path}")
+    print(f"[RESEARCH] Finding: {findings['interpretation']}  Δ={findings['sync_effect']}")
+    return findings
+
+
 # ─── End Screen ───────────────────────────────────────────────────────────────
-def draw_end_screen(screen, score, avg_sync, max_sync, tick):
+def draw_end_screen(screen, score, avg_sync, max_sync, tick, coherence_data=None, findings=None):
     screen.fill(BG_DARK)
     draw_grid(avg_sync)
     screen.blit(scanline_surf, (0, 0))
 
-    # Central panel
-    pw, ph = 700, 400
+    has_findings = findings and findings["sync_effect"] is not None
+    pw = 800
+    ph = 520 if has_findings else (460 if coherence_data else 400)
     px, py = WIDTH//2 - pw//2, HEIGHT//2 - ph//2
     panel = alpha_surface(BG_MID, pw, ph, 230)
     screen.blit(panel, (px, py))
     pygame.draw.rect(screen, PANEL_BORDER, (px, py, pw, ph), 2)
-    # Accent top bar
     pygame.draw.rect(screen, lerp_color(CYAN, SYNCED_COLOR, avg_sync), (px, py, pw, 3))
 
     title = font_mono_xl.render("SESSION COMPLETE", True, WHITE)
-    screen.blit(title, (WIDTH//2 - title.get_width()//2, py + 30))
+    screen.blit(title, (WIDTH//2 - title.get_width()//2, py + 22))
 
     sub = font_mono_md.render("INTER-BRAIN SYNCHRONIZATION REPORT", True, CYAN_DIM)
-    screen.blit(sub, (WIDTH//2 - sub.get_width()//2, py + 90))
-    pygame.draw.line(screen, PANEL_BORDER, (px + 40, py + 120), (px + pw - 40, py + 120), 1)
+    screen.blit(sub, (WIDTH//2 - sub.get_width()//2, py + 76))
+    pygame.draw.line(screen, PANEL_BORDER, (px + 40, py + 108), (px + pw - 40, py + 108), 1)
 
-    # Stats grid
+    # ── Top stats ─────────────────────────────────────────────────────────────
+    coh_val   = f"{int(coherence_data['composite']*100)}%" if coherence_data else "N/A"
+    coh_color = lerp_color(CYAN, SYNCED_COLOR, coherence_data['composite']) if coherence_data else WHITE_DIM
+
     stats = [
-        ("AVG NEURAL COHERENCE", f"{int(avg_sync*100)}%", lerp_color(CYAN, SYNCED_COLOR, avg_sync)),
-        ("PEAK SYNC",            f"{int(max_sync*100)}%", SYNCED_COLOR),
-        ("TOTAL CAPTURES",       str(score),              AMBER),
-        ("SESSION DURATION",     f"{TIME_LIMIT}s",        WHITE),
+        ("NEURAL COHERENCE",  coh_val,               coh_color),
+        ("AVG LIVE SYNC",     f"{int(avg_sync*100)}%", lerp_color(CYAN, WHITE, 0.5)),
+        ("PEAK SYNC",         f"{int(max_sync*100)}%", SYNCED_COLOR),
+        ("TOTAL CAPTURES",    str(score),              AMBER),
     ]
     col_w = (pw - 80) // 2
     for i, (label, val, color) in enumerate(stats):
         col = i % 2
         row = i // 2
         sx = px + 40 + col * (col_w + 40)
-        sy = py + 145 + row * 90
-        l_surf = font_mono_sm.render(label, True, WHITE_DIM)
-        v_surf = font_mono_lg.render(val, True, color)
-        screen.blit(l_surf, (sx, sy))
-        screen.blit(v_surf, (sx, sy + 18))
+        sy = py + 122 + row * 75
+        screen.blit(font_mono_sm.render(label, True, WHITE_DIM), (sx, sy))
+        screen.blit(font_mono_lg.render(val, True, color),        (sx, sy + 18))
 
-    pygame.draw.line(screen, PANEL_BORDER, (px + 40, py + 330), (px + pw - 40, py + 330), 1)
-    footer = font_mono_sm.render("PRESS  ESC  TO  EXIT", True, WHITE_DIM)
-    screen.blit(footer, (WIDTH//2 - footer.get_width()//2, py + 345))
+    y_cursor = py + 122 + 2 * 75 + 10
+
+    # ── Coherence band breakdown ───────────────────────────────────────────────
+    if coherence_data:
+        pygame.draw.line(screen, PANEL_BORDER, (px+40, y_cursor), (px+pw-40, y_cursor), 1)
+        y_cursor += 10
+        screen.blit(font_mono_sm.render(
+            f"COHERENCE BREAKDOWN  ·  {coherence_data['n_samples']} SAMPLES  ·  MAGNITUDE-SQUARED",
+            True, WHITE_DIM), (px+40, y_cursor))
+        y_cursor += 18
+        bands = [
+            ("α  ALPHA  8-12Hz", coherence_data['alpha'], CYAN),
+            ("β  BETA  13-30Hz", coherence_data['beta'],  PINK),
+            ("θ  THETA   4-7Hz", coherence_data['theta'], AMBER),
+        ]
+        track_x = px + 220
+        track_w = pw - 280
+        for blabel, bval, bcolor in bands:
+            screen.blit(font_mono_sm.render(blabel, True, WHITE_DIM), (px+40, y_cursor))
+            pygame.draw.rect(screen, (20,30,60),     (track_x, y_cursor+2, track_w, 13))
+            pygame.draw.rect(screen, PANEL_BORDER,   (track_x, y_cursor+2, track_w, 13), 1)
+            fill = int(track_w * max(0, bval))
+            if fill > 0:
+                pygame.draw.rect(screen, bcolor, (track_x, y_cursor+2, fill, 13))
+                screen.blit(alpha_surface(WHITE, fill, 6, 40), (track_x, y_cursor+2))
+            screen.blit(font_mono_sm.render(f"{int(bval*100):3d}%", True, bcolor),
+                        (track_x + track_w + 8, y_cursor))
+            y_cursor += 24
+
+    # ── FINDINGS panel ────────────────────────────────────────────────────────
+    if has_findings:
+        y_cursor += 6
+        pygame.draw.line(screen, PANEL_BORDER, (px+40, y_cursor), (px+pw-40, y_cursor), 1)
+        y_cursor += 10
+
+        # Header
+        screen.blit(font_mono_sm.render(
+            f"CAPTURE-SYNC CORRELATION  ·  KEY FINDING  ·  {findings.get('difficulty','')}", True, WHITE_DIM),
+                    (px+40, y_cursor))
+        y_cursor += 20
+
+        effect     = findings["sync_effect"]
+        cap_avg    = findings["capture_avg_sync"]
+        non_avg    = findings["noncap_avg_sync"]
+        interp     = findings["interpretation"]
+        interp_color = (SYNCED_COLOR if "POSITIVE" in interp
+                        else DANGER    if "NEGATIVE" in interp
+                        else WHITE_DIM)
+
+        # Two stat columns
+        col_items = [
+            ("SYNC AT CAPTURES",     f"{int(cap_avg*100)}%",  SYNCED_COLOR),
+            ("SYNC WITHOUT CAPTURES",f"{int(non_avg*100)}%",  WHITE_DIM),
+            ("SYNC EFFECT (Δ)",      f"{effect*100:+.1f}%",   interp_color),
+            ("RESULT",               interp,                   interp_color),
+        ]
+        for i, (label, val, color) in enumerate(col_items):
+            col = i % 2
+            row = i // 2
+            sx = px + 40 + col * (col_w + 40)
+            sy = y_cursor + row * 50
+            screen.blit(font_mono_sm.render(label, True, WHITE_DIM), (sx, sy))
+            screen.blit(font_mono_md.render(val,   True, color),     (sx, sy + 16))
+
+        y_cursor += 2 * 50 + 10
+
+        # CSV export notice
+        csv_name = findings["html_path"].split("/")[-1].split("\\")[-1]
+        screen.blit(font_mono_sm.render(f"GRAPH EXPORTED  →  {csv_name}", True, (60,80,120)),
+                    (px+40, y_cursor))
+        y_cursor += 18
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    pygame.draw.line(screen, PANEL_BORDER, (px+40, y_cursor+4), (px+pw-40, y_cursor+4), 1)
+    screen.blit(font_mono_sm.render("PRESS  ESC  TO  EXIT", True, WHITE_DIM),
+                (WIDTH//2 - font_mono_sm.size("PRESS  ESC  TO  EXIT")[0]//2, y_cursor + 12))
+
+    draw_sync_ring(WIDTH//2 + 360, HEIGHT//2,
+                   coherence_data['composite'] if coherence_data else avg_sync, tick)
+
+
+# ─── Difficulty Select Screen ─────────────────────────────────────────────────
+DIFFICULTIES = {
+    "SLOW":   {"speed": 1.8, "label": "SLOW",   "color": SYNCED_COLOR, "key": pygame.K_1, "desc": "Relaxed pace  ·  ideal for baseline"},
+    "MEDIUM": {"speed": 3.0, "label": "MEDIUM",  "color": AMBER,        "key": pygame.K_2, "desc": "Standard difficulty"},
+    "FAST":   {"speed": 5.5, "label": "FAST",    "color": DANGER,       "key": pygame.K_3, "desc": "High demand  ·  tests sync under stress"},
+}
+
+def draw_difficulty_screen(tick):
+    screen.fill(BG_DARK)
+    draw_grid(0.3)
+    screen.blit(scanline_surf, (0, 0))
+
+    title = font_mono_xl.render("NEURAL SYNCHRONICITY TEST", True, CYAN)
+    screen.blit(title, (WIDTH//2 - title.get_width()//2, 140))
+    sub = font_mono_md.render("SELECT DIFFICULTY  ·  PRESS  1 / 2 / 3", True, CYAN_DIM)
+    screen.blit(sub, (WIDTH//2 - sub.get_width()//2, 204))
+
+    card_w, card_h = 280, 160
+    gap     = 40
+    total_w = 3 * card_w + 2 * gap
+    start_x = WIDTH//2 - total_w//2
+
+    for i, (key, diff) in enumerate(DIFFICULTIES.items()):
+        cx = start_x + i * (card_w + gap)
+        cy = HEIGHT//2 - card_h//2
+
+        card_bg = alpha_surface(BG_MID, card_w, card_h, 200)
+        screen.blit(card_bg, (cx, cy))
+
+        pulse        = 0.5 + 0.5 * math.sin(tick * 0.06 + i * 1.2)
+        border_color = lerp_color(PANEL_BORDER, diff["color"], pulse * 0.4)
+        pygame.draw.rect(screen, border_color, (cx, cy, card_w, card_h), 2)
+
+        num = font_mono_xl.render(str(i+1), True, diff["color"])
+        screen.blit(num, (cx + card_w//2 - num.get_width()//2, cy + 18))
+
+        lbl = font_mono_lg.render(diff["label"], True, diff["color"])
+        screen.blit(lbl, (cx + card_w//2 - lbl.get_width()//2, cy + 78))
+
+        desc = font_mono_sm.render(diff["desc"], True, WHITE_DIM)
+        screen.blit(desc, (cx + card_w//2 - desc.get_width()//2, cy + 118))
+
+        for d in range(3):
+            dot_color = diff["color"] if d <= i else PANEL_BORDER
+            pygame.draw.circle(screen, dot_color, (cx + card_w//2 - 20 + d*20, cy + 144), 5)
+
+    hint = font_mono_sm.render(
+        "DIFFICULTY IS LOGGED AS AN INDEPENDENT VARIABLE IN YOUR RESEARCH EXPORT",
+        True, (50, 70, 110))
+    screen.blit(hint, (WIDTH//2 - hint.get_width()//2, HEIGHT - 80))
+
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    player_pos = [WIDTH // 2, HEIGHT // 2]
-    target_pos = [random.randint(120, WIDTH-120), random.randint(120, HEIGHT-160)]
-    target_speed = 3.0
-    target_dir = [random.choice([-1, 1]), random.choice([-1, 1])]
+    # ── UDP socket setup — done HERE, not at module level ─────────────────────
+    # Moving bind() inside main() prevents an OSError on port 5005 (e.g. from a
+    # previous run that hasn't fully released the socket) from crashing the
+    # script before the pygame window ever opens and the difficulty screen shows.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # allow rapid restarts
+    try:
+        sock.bind((UDP_IP, UDP_PORT))
+    except OSError as e:
+        print(f"[NET] Warning: could not bind UDP port {UDP_PORT}: {e}")
+        print("[NET] Continuing without live BCI data (demo sine-wave mode).")
+    sock.setblocking(False)
 
-    score = 0
-    start_time = time.time()
+    player_pos   = [WIDTH // 2, HEIGHT // 2]
+    target_pos   = [random.randint(120, WIDTH-120), random.randint(120, HEIGHT-160)]
+    target_dir   = [random.choice([-1, 1]), random.choice([-1, 1])]
+    target_speed = 3.0   # overwritten on difficulty select
+
+    # ── State ─────────────────────────────────────────────────────────────────
+    in_menu    = True
+    game_over  = False
+    difficulty = None
+    time_limit = TIME_LIMIT
+    start_time = None   # set when player picks difficulty
+
+    score       = 0
     neural_sync = 0.0
     sync_history = []
-    tick = 0
-    max_sync = 0.0
-    game_over = False
+    tick         = 0
+    max_sync     = 0.0
+    coherence_data = None
+    band_vals    = {"alpha": 0.0, "beta": 0.0, "theta": 0.0}
+
+    # ── Research logging ──────────────────────────────────────────────────────
+    capture_log   = []
+    sync_timeline = []
+    last_log_time = 0.0
+    findings      = None
 
     running = True
     while running:
         tick += 1
-        elapsed_time = time.time() - start_time
-        remaining_time = max(0, TIME_LIMIT - elapsed_time)
 
-        if remaining_time <= 0 and not game_over:
-            game_over = True
-
-        # ── Receive Brain Data ────────────────────────────────────────────────
+        # ── Receive Brain Data (runs in all states so waveform is live on menu) ─
         try:
             data, addr = sock.recvfrom(1024)
-            neural_sync = float(data.decode())
+            parts = data.decode().split(",")
+            neural_sync = max(0.0, min(1.0, float(parts[0])))
+            if len(parts) == 4:
+                band_vals["alpha"] = float(parts[1])
+                band_vals["beta"]  = float(parts[2])
+                band_vals["theta"] = float(parts[3])
+        except:
+            # No data yet — use sine-wave demo signal
+            neural_sync = 0.5 + 0.4 * math.sin(tick * 0.02)
             neural_sync = max(0.0, min(1.0, neural_sync))
+
+        if not game_over:
             sync_history.append(neural_sync)
             if neural_sync > max_sync:
                 max_sync = neural_sync
-        except:
-            # Demo: slowly drift sync value when no data
-            neural_sync = 0.5 + 0.4 * math.sin(tick * 0.02)
-            neural_sync = max(0.0, min(1.0, neural_sync))
-            sync_history.append(neural_sync)
 
+        # ── Events ────────────────────────────────────────────────────────────
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
@@ -650,21 +1142,61 @@ def main():
                 if event.key == pygame.K_ESCAPE:
                     running = False
 
-        # ── Game Over Screen ──────────────────────────────────────────────────
+                # ── Difficulty selection — only active in menu ─────────────
+                # Check both pygame key constants AND event.unicode so the
+                # selection works regardless of pygame version or keyboard layout.
+                if in_menu:
+                    choice = None
+                    key_char = getattr(event, 'unicode', '')
+                    if event.key == pygame.K_1 or key_char == '1': choice = "SLOW"
+                    if event.key == pygame.K_2 or key_char == '2': choice = "MEDIUM"
+                    if event.key == pygame.K_3 or key_char == '3': choice = "FAST"
+                    # Also accept numpad
+                    if event.key == pygame.K_KP1: choice = "SLOW"
+                    if event.key == pygame.K_KP2: choice = "MEDIUM"
+                    if event.key == pygame.K_KP3: choice = "FAST"
+                    if choice:
+                        difficulty   = DIFFICULTIES[choice]
+                        target_speed = difficulty["speed"]
+                        start_time   = time.time()
+                        in_menu      = False
+
+        # ── Menu render ───────────────────────────────────────────────────────
+        if in_menu:
+            draw_difficulty_screen(tick)
+            pygame.display.flip()
+            clock.tick(FPS)
+            continue
+
+        # ── Timer ─────────────────────────────────────────────────────────────
+        elapsed        = time.time() - start_time
+        remaining_time = max(0, time_limit - elapsed)
+
+        if remaining_time <= 0 and not game_over:
+            game_over = True
+            avg_sync_final = sum(sync_history)/len(sync_history) if sync_history else 0
+            coherence_data = compute_session_coherence()
+            findings = analyse_and_export(
+                capture_log, sync_timeline, coherence_data,
+                avg_sync_final, score, difficulty["label"])
+            if coherence_data:
+                print(f"\n[BCI] Session coherence: α={coherence_data['alpha']:.3f}  "
+                      f"β={coherence_data['beta']:.3f}  θ={coherence_data['theta']:.3f}  "
+                      f"composite={coherence_data['composite']:.3f}")
+
+        # ── Game Over screen ──────────────────────────────────────────────────
         if game_over:
             avg_sync = sum(sync_history)/len(sync_history) if sync_history else 0
-            draw_end_screen(screen, score, avg_sync, max_sync, tick)
+            draw_end_screen(screen, score, avg_sync, max_sync, tick, coherence_data, findings)
             pygame.display.flip()
             clock.tick(FPS)
             continue
 
         # ── Player Movement ───────────────────────────────────────────────────
-        keys = pygame.key.get_pressed()
+        keys  = pygame.key.get_pressed()
         speed = 5 + (neural_sync * 9)
-        # P1 (cyan, X-axis): A / D keys — left side of keyboard
-        if keys[pygame.K_a]: player_pos[0] -= speed
-        if keys[pygame.K_d]: player_pos[0] += speed
-        # P2 (pink, Y-axis): UP / DOWN arrow keys — right side of keyboard
+        if keys[pygame.K_a]:    player_pos[0] -= speed
+        if keys[pygame.K_d]:    player_pos[0] += speed
         if keys[pygame.K_UP]:   player_pos[1] -= speed
         if keys[pygame.K_DOWN]: player_pos[1] += speed
         player_pos[0] = max(0, min(WIDTH, player_pos[0]))
@@ -677,10 +1209,16 @@ def main():
         if target_pos[0] <= 60 or target_pos[0] >= WIDTH - 60:   target_dir[0] *= -1
         if target_pos[1] <= 70 or target_pos[1] >= HEIGHT - 130: target_dir[1] *= -1
 
+        # ── Research: log sync once per second ───────────────────────────────
+        if elapsed - last_log_time >= 1.0:
+            sync_timeline.append((round(elapsed, 2), round(neural_sync, 4)))
+            last_log_time = elapsed
+
         # ── Capture Logic ─────────────────────────────────────────────────────
         dist = math.hypot(player_pos[0] - target_pos[0], player_pos[1] - target_pos[1])
         if dist < 45:
             score += 1
+            capture_log.append((round(elapsed, 2), round(neural_sync, 4)))
             capture_color = lerp_color(CYAN, SYNCED_COLOR, neural_sync)
             spawn_capture_burst(target_pos[0], target_pos[1], capture_color)
             target_pos = [random.randint(100, WIDTH-120), random.randint(80, HEIGHT-150)]
@@ -699,33 +1237,22 @@ def main():
         screen.fill(BG_DARK)
         draw_grid(neural_sync)
 
-        # Background vignette
-        vignette = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        for r in range(500, 0, -20):
-            alpha = max(0, int(60 * (1 - r / 500)))
-            pygame.draw.circle(vignette, (0, 0, 0, alpha), (WIDTH//2, HEIGHT//2), r)
-        # Apply as darkening at edges - reverse vignette
         edge_vignette = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        edge_vignette.fill((0, 0, 0, 0))
-        pygame.draw.rect(edge_vignette, (0, 0, 20, 60), (0, 0, WIDTH, HEIGHT))
+        edge_vignette.fill((0, 0, 20, 60))
         pygame.draw.circle(edge_vignette, (0, 0, 0, 0), (WIDTH//2, HEIGHT//2), 500)
         screen.blit(edge_vignette, (0, 0))
 
-        # Particles
         for p in particles:
             p.draw(screen)
 
         draw_target(int(target_pos[0]), int(target_pos[1]), neural_sync, tick)
         draw_player(int(player_pos[0]), int(player_pos[1]), neural_sync, tick)
 
-        # HUD
         draw_top_hud(remaining_time, score, neural_sync, tick)
         draw_bottom_hud(neural_sync, sync_history, tick)
-        draw_side_stats(neural_sync, score, tick)
+        draw_side_stats(neural_sync, score, tick, band_vals)
 
-        # Scanlines overlay
         screen.blit(scanline_surf, (0, 0))
-
         pygame.display.flip()
         clock.tick(FPS)
 
